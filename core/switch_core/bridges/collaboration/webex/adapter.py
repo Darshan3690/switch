@@ -307,7 +307,7 @@ class WebexAdapter(PlatformAdapter):
 
             channel_id = msg.get("roomId", "")
             channel_type: ChannelType = (
-                "channel_private"
+                "direct"
                 if msg.get("roomType") == "direct"
                 else "channel_public"
             )
@@ -462,7 +462,7 @@ class WebexAdapter(PlatformAdapter):
             person_id = data.get("personId", "")
             person_email = data.get("personEmail", "")
             membership_channel_type: ChannelType = (
-                "channel_private"
+                "direct"
                 if data.get("roomType") == "direct"
                 else "channel_public"
             )
@@ -588,7 +588,7 @@ class WebexAdapter(PlatformAdapter):
         resp = await self.client.get(f"/rooms/{channel_id}")
         resp.raise_for_status()
         room = resp.json()
-        return "channel_private" if room.get("type") == "direct" else "channel_public"
+        return "direct" if room.get("type") == "direct" else "channel_public"
 
     async def add_agents_to_channel(
         self, channel_id: str, agent_names: list[str]

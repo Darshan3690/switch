@@ -388,7 +388,7 @@ class TestInboundEventDispatching:
         cmd: InboundCommand = on_cmd.call_args[0][0]
         assert cmd.command == "help"
         assert cmd.args == "agents"
-        assert cmd.channel_type == "channel_private"
+        assert cmd.channel_type == "direct"
 
     @pytest.mark.asyncio
     async def test_dispatch_attachment_actions_verified_endpoint(
