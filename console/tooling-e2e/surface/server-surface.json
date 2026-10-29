@@ -25,6 +25,7 @@
     "get_room_group_detail",
     "get_template",
     "get_template_guide",
+    "get_template_status",
     "invite_agent_to_room",
     "link_rooms",
     "list_agents",
@@ -118,11 +119,6 @@
       "flags": [
         "service_connections"
       ]
-    },
-    {
-      "route": "DELETE /gateway/connectors/{connector_id}",
-      "auth": "session",
-      "flags": []
     },
     {
       "route": "DELETE /gateway/documents/{document_id}",
@@ -434,21 +430,6 @@
       "flags": [
         "service_connections"
       ]
-    },
-    {
-      "route": "GET /gateway/connectors",
-      "auth": "session",
-      "flags": []
-    },
-    {
-      "route": "GET /gateway/connectors/types",
-      "auth": "session",
-      "flags": []
-    },
-    {
-      "route": "GET /gateway/connectors/{connector_id}",
-      "auth": "session",
-      "flags": []
     },
     {
       "route": "GET /gateway/docs",
@@ -1031,11 +1012,6 @@
       ]
     },
     {
-      "route": "POST /gateway/connectors",
-      "auth": "session",
-      "flags": []
-    },
-    {
       "route": "POST /gateway/documents",
       "auth": "session",
       "flags": []
@@ -1403,6 +1379,11 @@
       "flags": [
         "service_connections"
       ]
+    },
+    {
+      "route": "WS /gateway/changes/ws",
+      "auth": "session",
+      "flags": []
     }
   ]
 }
