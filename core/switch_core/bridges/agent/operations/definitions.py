@@ -19,6 +19,7 @@ from typing import Any
 from switch_core.agent_refusals import AgentRefused, record_refusal
 from switch_core.agent_template_ops import ActingFor, AgentTemplates
 from switch_core.agent_templates import plan_template
+from switch_core.authz import Principal
 from switch_core.bridges.agent.api.handlers import parse_timestamp_ms
 from switch_core.bridges.agent.operations.agent_management import (
     management_permission,
@@ -58,8 +59,9 @@ from switch_core.clients.agent_admin import DELETE_CONFIRM_SECONDS
 from switch_core.db.models import CollaborationBridge, User, require_tenant_id
 from switch_core.db.stores.template_store import TemplateStore
 from switch_core.feature_flags import AGENT_MANAGEMENT, SWITCH_BUDDY
-from switch_core.rooms_yaml import GroupSpec, template_json_schema
+from switch_core.rooms_yaml import GroupSpec, RoomReader, template_json_schema
 from switch_core.template_guide import TEMPLATE_GUIDE
+from switch_core.template_installs import InstallSource, record_install, source_of
 from switch_core.template_runs import (
     LISTEN_TIMEOUT_SECONDS,
     AgentsNotCreated,
@@ -709,8 +711,8 @@ async def read_context(
         room_id = sole_connected_room(connected)
 
     protocol = get_protocol()
-    since_ms = parse_timestamp_ms(since) if since else None
-    before_ms = parse_timestamp_ms(before) if before else None
+    since_ms = parse_timestamp_ms("since", since) if since else None
+    before_ms = parse_timestamp_ms("before", before) if before else None
 
     buffer = protocol.event_buffer
     tenant_id = require_tenant_id()
@@ -1599,7 +1601,9 @@ async def create_room_from_yaml(
     """
     async with _refusals_reported("create_room_from_yaml"):
         if is_v2_text(yaml):
-            return await _run_document(yaml, inputs, {}, template_name=None)
+            return await _run_document(
+                yaml, inputs, {}, template_name=None, source=None
+            )
         return await _provision_as_agent(
             yaml, inputs, template_name=None, new_agents=[], room_addressing={}
         )
@@ -1696,12 +1700,14 @@ async def _provision_as_agent(
         return {"created_agents": _created_view(created)}
 
     rooms_yaml = protocol.room_yaml_service()
-    inputs = await rooms_yaml.resolve_defaults(yaml, inputs)
+    # As the owner without admin reach, plus the rooms the agent is in.
+    reader = RoomReader(Principal(owner.id, False), agent_id=agent.id)
+    inputs = await rooms_yaml.resolve_defaults(yaml, inputs, reader=reader)
     builtins = await rooms_yaml.builtins_for(
         user_id=owner.id, name=owner.name, email=owner.email, text=yaml, inputs=inputs
     )
     parsed = rooms_yaml.parse_template(yaml, inputs=inputs, builtins=builtins)
-    await rooms_yaml.check_entity_params(parsed)
+    await rooms_yaml.check_entity_params(parsed, reader=reader)
     await rooms_yaml.check_bridges(parsed)
     room_specs = (
         [(r, r.kickoff) for r in parsed.spec.rooms]
@@ -1934,7 +1940,13 @@ async def run_template(
         async with protocol.session_factory() as session:
             template = await _agent_templates().load(session, acting, template_id)
             content, name = template.content, template.name
-        return await _run_document(content, inputs, agents or {}, template_name=name)
+        return await _run_document(
+            content,
+            inputs,
+            agents or {},
+            template_name=name,
+            source=source_of(template),
+        )
 
 
 async def _run_document(
@@ -1943,16 +1955,24 @@ async def _run_document(
     filled: dict[str, str],
     *,
     template_name: str | None,
+    source: InstallSource | None,
 ) -> dict[str, Any]:
     """Work a template's agents and rooms out of its document and create
-    them, as the calling agent."""
+    them, as the calling agent. With a `source`, the agents it creates are
+    recorded as that template's install, to be updated from it."""
     protocol = get_protocol()
     acting = await _acting_for()
     rooms_yaml = protocol.room_yaml_service()
     if is_v2_text(content):
         # A version 2 condition may read a messaging app or room param
         # whose value is the first candidate the server has.
-        inputs = await rooms_yaml.resolve_defaults(content, inputs)
+        inputs = await rooms_yaml.resolve_defaults(
+            content,
+            inputs,
+            reader=RoomReader(
+                Principal(acting.owner.id, False), agent_id=acting.agent.id
+            ),
+        )
     builtins = await rooms_yaml.builtins_for(
         user_id=acting.owner.id,
         name=acting.owner.name,
@@ -1967,13 +1987,26 @@ async def _run_document(
         builtins=builtins,
         machines=await _owners_machines(),
     )
-    return await _provision_as_agent(
+    result = await _provision_as_agent(
         plan.document,
         plan.inputs or None,
         template_name=template_name,
         new_agents=plan.new_agents,
         room_addressing=plan.room_addressing,
     )
+    if source is not None:
+        await record_install(
+            protocol.session_factory,
+            require_tenant_id(),
+            owner_id=acting.owner.id,
+            source=source,
+            document=content,
+            inputs=inputs or {},
+            builtins=builtins,
+            plans=plan.new_agents,
+            created=result.get("created_agents") or [],
+        )
+    return result
 
 
 async def _owners_machines() -> list[dict[str, Any]] | None:
@@ -2200,8 +2233,8 @@ async def request_agent_deletion(agent_id: str) -> dict[str, Any]:
     minutes; otherwise it lapses. Confirm with the person asking before you
     call this, and tell them what to send.
 
-    Refused for an agent of another owner, yourself, an agent that can manage
-    agents, and one a server connector found.
+    Refused for an agent of another owner, yourself, and an agent that can
+    manage agents.
 
     Args:
         agent_id: The agent to delete (`id` from `list_agents`).
@@ -2262,8 +2295,8 @@ async def update_agent_detail(
             notes-writer); otherwise the label stays. Rooms, roles, aliases and
             credentials follow; its handle on each chat platform is renamed
             too. Refused for a name in use, one that clashes with an alias or
-            role in its rooms or a handle on a chat platform, a subagent or a
-            parent of subagents, and an agent a server connector found.
+            role in its rooms or a handle on a chat platform, a subagent, and a
+            parent of subagents.
         description: What the agent is for.
         display_name: Human label shown next to its name; "" clears it.
         icon_url: An https link to its icon; "" clears it. A server with
