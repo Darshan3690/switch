@@ -13,6 +13,7 @@ from switch_core.bridges.collaboration.models import (
     InboundMessage,
 )
 from switch_core.bridges.collaboration.signal.adapter import (
+    MAX_QUOTE_CACHE,
     SignalAdapter,
     SignalConnectionConfig,
 )
@@ -21,6 +22,7 @@ from switch_core.bridges.collaboration.signal.client import (
     ProofRequiredException,
     RateLimitException,
     SignalRpcClient,
+    SignalRpcError,
     UntrustedIdentityException,
 )
 
@@ -47,6 +49,14 @@ class TestSignalConnectionConfig:
                 endpoint_url="ftp://127.0.0.1:8080",
                 account="+1234567890",
             )
+
+    def test_strip_surrounding_whitespace(self) -> None:
+        cfg = SignalConnectionConfig(
+            endpoint_url="  http://127.0.0.1:8080/  ",
+            account="  +1234567890  ",
+        )
+        assert cfg.endpoint_url == "http://127.0.0.1:8080"
+        assert cfg.account == "+1234567890"
 
     def test_empty_account(self) -> None:
         with pytest.raises(ValueError, match="account cannot be empty"):
@@ -78,7 +88,9 @@ class TestSignalRpcClient:
             assert call_json["method"] == "send"
             assert call_json["params"] == {"message": "hi"}
 
-    async def test_rpc_call_untrusted_identity_error(self, client: SignalRpcClient) -> None:
+    async def test_rpc_call_untrusted_identity_error(
+        self, client: SignalRpcClient
+    ) -> None:
         mock_response = httpx.Response(
             200,
             json={
@@ -275,15 +287,14 @@ class TestSignalAdapter:
             adapter.classify_failure(RateLimitException(-1, "rate limit"))
             == "platform_error"
         )
-        assert (
-            adapter.classify_failure(httpx.ConnectError("refused"))
-            == "network"
-        )
+        assert adapter.classify_failure(httpx.ConnectError("refused")) == "network"
 
     async def test_start_unhealthy_raises_credential_error(
         self, adapter: SignalAdapter
     ) -> None:
-        with patch.object(adapter._client, "check_health", new_callable=AsyncMock) as mock_health:
+        with patch.object(
+            adapter._client, "check_health", new_callable=AsyncMock
+        ) as mock_health:
             mock_health.return_value = False
             with pytest.raises(BridgeCredentialError):
                 await adapter.start(
@@ -318,7 +329,10 @@ class TestSignalAdapter:
         assert msg.content == "Hello Switch"
         assert msg.channel_id == "+1987654321"
         assert msg.channel_type == "direct"
-        assert msg.message_ref == "+1234567890:signal:direct:+1987654321:+1987654321:1729760000000"
+        assert (
+            msg.message_ref
+            == "+1234567890:signal:direct:+1987654321:+1987654321:1729760000000"
+        )
 
     async def test_process_event_command(self, adapter: SignalAdapter) -> None:
         received_commands: list[InboundCommand] = []
@@ -372,9 +386,14 @@ class TestSignalAdapter:
     async def test_send_message_with_quote_and_chunking(
         self, adapter: SignalAdapter
     ) -> None:
-        adapter._quote_cache[("+1987654321", 1729759900000)] = ("+1987654321", "prior text")
+        adapter._quote_cache[("+1987654321", 1729759900000)] = (
+            "+1987654321",
+            "prior text",
+        )
 
-        with patch.object(adapter._client, "send_message", new_callable=AsyncMock) as mock_send:
+        with patch.object(
+            adapter._client, "send_message", new_callable=AsyncMock
+        ) as mock_send:
             mock_send.return_value = 1729760000123
             sent_id = await adapter.send_message(
                 channel_id="+1987654321",
@@ -392,6 +411,203 @@ class TestSignalAdapter:
                 quote_author="+1987654321",
                 quote_message="prior text",
             )
+
+    def test_docs_slug(self) -> None:
+        assert SignalAdapter.docs_slug == "signal"
+
+    async def test_fresh_adapter_quote_reply_without_cache(
+        self, adapter: SignalAdapter
+    ) -> None:
+        """After pod handoff or restart, cache is empty but quoteTimestamp must still be passed."""
+        assert len(adapter._quote_cache) == 0
+
+        with patch.object(
+            adapter._client, "send_message", new_callable=AsyncMock
+        ) as mock_send:
+            mock_send.return_value = 1729760000456
+            sent_id = await adapter.send_message(
+                channel_id="+1987654321",
+                sender_name="Claude",
+                content="Cold start reply",
+                thread_root_id="1729759900000",
+            )
+
+            assert sent_id == "1729760000456"
+            mock_send.assert_called_once_with(
+                "[Claude] Cold start reply",
+                recipient="+1987654321",
+                group_id=None,
+                quote_timestamp=1729759900000,
+                quote_author=None,
+                quote_message=None,
+            )
+
+    def test_quote_cache_lru_eviction(self, adapter: SignalAdapter) -> None:
+        for i in range(MAX_QUOTE_CACHE + 10):
+            adapter._cache_quote("+123", i, "author", f"text {i}")
+
+        assert len(adapter._quote_cache) == MAX_QUOTE_CACHE
+        # Oldest entries (0..9) should be evicted
+        assert ("+123", 0) not in adapter._quote_cache
+        assert ("+123", 9) not in adapter._quote_cache
+        # Newest entries should be present
+        assert ("+123", MAX_QUOTE_CACHE + 9) in adapter._quote_cache
+
+    async def test_bracket_message_not_filtered(self, adapter: SignalAdapter) -> None:
+        received_messages: list[InboundMessage] = []
+
+        async def on_message(msg: InboundMessage) -> None:
+            received_messages.append(msg)
+
+        adapter._on_message = on_message
+
+        event = {
+            "envelope": {
+                "source": "+1987654321",
+                "sourceName": "Operator",
+                "dataMessage": {
+                    "timestamp": 1729760000000,
+                    "message": "[urgent] please help with the cluster",
+                },
+            }
+        }
+
+        await adapter._process_event(event)
+        assert len(received_messages) == 1
+        assert received_messages[0].content == "[urgent] please help with the cluster"
+
+    async def test_outbound_echo_filtered_by_timestamp(
+        self, adapter: SignalAdapter
+    ) -> None:
+        received_messages: list[InboundMessage] = []
+
+        async def on_message(msg: InboundMessage) -> None:
+            received_messages.append(msg)
+
+        adapter._on_message = on_message
+
+        with patch.object(
+            adapter._client, "send_message", new_callable=AsyncMock
+        ) as mock_send:
+            mock_send.return_value = 1729760000789
+            await adapter.send_message(
+                channel_id="+1987654321",
+                sender_name="Claude",
+                content="Hello there",
+            )
+
+        # Inbound echo with matching sent timestamp should be dropped
+        event = {
+            "envelope": {
+                "source": "+1234567890",
+                "dataMessage": {
+                    "timestamp": 1729760000789,
+                    "message": "[Claude] Hello there",
+                },
+            }
+        }
+        await adapter._process_event(event)
+        assert len(received_messages) == 0
+
+    async def test_mark_activity(self, adapter: SignalAdapter) -> None:
+        message_ref = "+1234567890:signal:direct:+1987654321:+1987654321:1729759900000"
+
+        with patch.object(
+            adapter._client, "send_reaction", new_callable=AsyncMock
+        ) as mock_react:
+            await adapter.mark_activity(
+                "+1987654321",
+                message_ref,
+                agent_name="Claude",
+                mark="working",
+                on=True,
+            )
+            mock_react.assert_called_once_with(
+                emoji="👀",
+                target_author="+1987654321",
+                target_timestamp=1729759900000,
+                recipient="+1987654321",
+                group_id=None,
+                remove=False,
+            )
+
+        with patch.object(
+            adapter._client, "send_reaction", new_callable=AsyncMock
+        ) as mock_react:
+            await adapter.mark_activity(
+                "+1987654321",
+                message_ref,
+                agent_name="Claude",
+                mark="working",
+                on=False,
+            )
+            mock_react.assert_called_once_with(
+                emoji="👀",
+                target_author="+1987654321",
+                target_timestamp=1729759900000,
+                recipient="+1987654321",
+                group_id=None,
+                remove=True,
+            )
+
+    async def test_add_users_to_channel_returns_failed_ids(
+        self, adapter: SignalAdapter
+    ) -> None:
+        failed = await adapter.add_users_to_channel(
+            "group:testgroup",
+            ["Alice", "Bob"],
+            ["+11111", "+22222"],
+        )
+        assert failed == ["+11111", "+22222"]
+
+    async def test_verify_credentials_success(self) -> None:
+        cfg = {"endpoint_url": "http://127.0.0.1:8080", "account": "+1234567890"}
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            patch.object(
+                SignalRpcClient, "list_groups", new_callable=AsyncMock
+            ) as mock_groups,
+        ):
+            mock_get.return_value = httpx.Response(
+                200, request=httpx.Request("GET", "http://127.0.0.1:8080/api/v1/check")
+            )
+            mock_groups.return_value = []
+            await SignalAdapter.verify_credentials(cfg)
+
+    async def test_verify_credentials_unreachable(self) -> None:
+        cfg = {"endpoint_url": "http://127.0.0.1:8080", "account": "+1234567890"}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = httpx.ConnectError("Connection refused")
+            with pytest.raises(
+                BridgeCredentialError, match="Cannot reach Signal daemon"
+            ):
+                await SignalAdapter.verify_credentials(cfg)
+
+    async def test_verify_credentials_health_failure(self) -> None:
+        cfg = {"endpoint_url": "http://127.0.0.1:8080", "account": "+1234567890"}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = httpx.Response(
+                503, request=httpx.Request("GET", "http://127.0.0.1:8080/api/v1/check")
+            )
+            with pytest.raises(
+                BridgeCredentialError, match="health check returned HTTP 503"
+            ):
+                await SignalAdapter.verify_credentials(cfg)
+
+    async def test_verify_credentials_account_error(self) -> None:
+        cfg = {"endpoint_url": "http://127.0.0.1:8080", "account": "+1234567890"}
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            patch.object(
+                SignalRpcClient, "list_groups", new_callable=AsyncMock
+            ) as mock_groups,
+        ):
+            mock_get.return_value = httpx.Response(
+                200, request=httpx.Request("GET", "http://127.0.0.1:8080/api/v1/check")
+            )
+            mock_groups.side_effect = SignalRpcError(-32600, "Account not registered")
+            with pytest.raises(BridgeCredentialError, match="Signal account.*error"):
+                await SignalAdapter.verify_credentials(cfg)
 
 
 class TestSignalChunking:

@@ -82,7 +82,11 @@ class SignalRpcClient:
             err_data = err.get("data")
 
             msg_lower = msg.lower()
-            if "untrusted identity" in msg_lower or "identity" in msg_lower and "changed" in msg_lower:
+            if (
+                "untrusted identity" in msg_lower
+                or "identity" in msg_lower
+                and "changed" in msg_lower
+            ):
                 raise UntrustedIdentityException(code, msg, err_data)
             if "proof required" in msg_lower or "challenge" in msg_lower:
                 raise ProofRequiredException(code, msg, err_data)
@@ -243,7 +247,9 @@ class SignalRpcClient:
             headers["Last-Event-ID"] = last_event_id
 
         url = f"{self.endpoint_url}/api/v1/events"
-        async with self._client.stream("GET", url, headers=headers, timeout=None) as response:
+        async with self._client.stream(
+            "GET", url, headers=headers, timeout=None
+        ) as response:
             response.raise_for_status()
 
             current_id: str | None = None

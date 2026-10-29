@@ -42,11 +42,16 @@ Scan the generated QR code in your Signal mobile app under **Settings → Linked
 
 Start the daemon in HTTP mode:
 ```bash
-signal-cli -a +1234567890 daemon --http=127.0.0.1:8080
+signal-cli -a +1234567890 daemon --http=0.0.0.0:8080
 ```
 
-*Note for containerized environments*:
-If Switch runs in separate Docker containers or Kubernetes pods, bind to your internal service network interface (e.g. `http://signal-cli.internal:8080`). Ensure firewall or network policies prevent outside access.
+> **Multipod & Production Architecture Note**:
+> In horizontal or multipod deployments where multiple `switch-core` instances run side by side, whichever instance holds the active bridge lease connects to the daemon over HTTP and opens the SSE stream. A localhost address (`127.0.0.1`) only works if Switch and the daemon share the exact same network container/namespace.
+>
+> In multi-container, Kubernetes, or multi-server deployments:
+> - Bind the daemon to `0.0.0.0:8080` (or your internal VPC/pod network interface).
+> - Configure Switch with a shared, reachable internal service hostname (e.g. `http://signal-cli:8080` or `http://signal-cli.internal:8080`).
+> - Keep the daemon inside a private network or protected by firewall/network policies, as the JSON-RPC daemon HTTP API is unauthenticated.
 
 ---
 
@@ -55,7 +60,7 @@ If Switch runs in separate Docker containers or Kubernetes pods, bind to your in
 1. Open **Switch Console** and navigate to your server.
 2. Under **Messaging apps**, select **Connect**, then choose **Signal**.
 3. Fill in the connection settings:
-   - **Endpoint URL**: The HTTP address of your signal-cli daemon (e.g., `http://127.0.0.1:8080` or `http://signal-cli.internal:8080`).
+   - **Endpoint URL**: The shared HTTP address of your signal-cli daemon reachable by all Switch instances (e.g., `http://signal-cli:8080` or `http://signal-cli.internal:8080`).
    - **Account**: The E.164 phone number configured for the daemon (e.g., `+1234567890`).
 4. Save the connection. Switch will verify daemon health and account registration via `listGroups`.
 

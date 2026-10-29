@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar
 from urllib.parse import urlparse
@@ -53,6 +54,9 @@ _REACTION_MAP: dict[ActivityMark, str] = {
     "queued": "⏳",
 }
 
+MAX_QUOTE_CACHE: int = 1000
+MAX_OUTBOUND_TIMESTAMPS: int = 1000
+
 
 class SignalConnectionConfig(BridgeConnectionConfig):
     """Configuration for connecting to a local or internal signal-cli daemon."""
@@ -63,12 +67,13 @@ class SignalConnectionConfig(BridgeConnectionConfig):
     @field_validator("endpoint_url")
     @classmethod
     def validate_endpoint(cls, v: str) -> str:
-        parsed = urlparse(v.strip())
+        s = v.strip()
+        parsed = urlparse(s)
         if not parsed.scheme or parsed.scheme not in ("http", "https"):
             raise ValueError("endpoint_url must have http or https scheme")
         if not parsed.netloc:
             raise ValueError("endpoint_url must include a valid host and port")
-        return v.rstrip("/")
+        return s.rstrip("/")
 
     @field_validator("account")
     @classmethod
@@ -83,7 +88,7 @@ class SignalAdapter(PlatformAdapter):
     """Switch collaboration adapter for Signal messaging network."""
 
     display_name: ClassVar[str] = "Signal"
-    docs_slug: ClassVar[str | None] = None  # None until docs published
+    docs_slug: ClassVar[str | None] = "signal"
     icon_file: ClassVar[str] = "icon.svg"
 
     receives_webhooks: ClassVar[bool] = False
@@ -110,8 +115,75 @@ class SignalAdapter(PlatformAdapter):
         self._listen_task: asyncio.Task[None] | None = None
         self._stopped = False
         self._last_event_id: str | None = None
-        # Cache of recent messages for quote-reply context: (channel_id, timestamp) -> (author, text)
-        self._quote_cache: dict[tuple[str, int], tuple[str, str | None]] = {}
+        # Bounded LRU cache of recent messages for quote-reply context: (channel_id, timestamp) -> (author, text)
+        self._quote_cache: OrderedDict[tuple[str, int], tuple[str, str | None]] = (
+            OrderedDict()
+        )
+        # Bounded LRU set of outbound message timestamps to filter out reflection / echo
+        self._outbound_timestamps: OrderedDict[int, None] = OrderedDict()
+
+    def _cache_quote(
+        self, channel_id: str, timestamp: int, author: str, text: str | None
+    ) -> None:
+        """Store quote metadata in LRU cache, evicting oldest when full."""
+        self._quote_cache[(channel_id, timestamp)] = (author, text)
+        if len(self._quote_cache) > MAX_QUOTE_CACHE:
+            self._quote_cache.popitem(last=False)
+
+    def _record_outbound_timestamp(self, timestamp: int) -> None:
+        """Record outbound message timestamp to prevent self-loop echo."""
+        self._outbound_timestamps[timestamp] = None
+        if len(self._outbound_timestamps) > MAX_OUTBOUND_TIMESTAMPS:
+            self._outbound_timestamps.popitem(last=False)
+
+    @classmethod
+    async def verify_credentials(cls, connection_config: dict[str, object]) -> None:
+        """Prove the daemon is reachable and account is valid before saving."""
+        url = connection_config.get("endpoint_url")
+        account = connection_config.get("account")
+        if not isinstance(url, str) or not url.strip():
+            raise BridgeCredentialError("endpoint_url is required")
+        if not isinstance(account, str) or not account.strip():
+            raise BridgeCredentialError("account is required")
+
+        norm_url = url.strip().rstrip("/")
+        norm_account = account.strip()
+
+        client = SignalRpcClient(norm_url, norm_account)
+        try:
+            try:
+                resp = await client._client.get(f"{norm_url}/api/v1/check")
+                if resp.status_code != 200:
+                    raise BridgeCredentialError(
+                        f"Signal daemon health check returned HTTP {resp.status_code}"
+                    )
+            except httpx.HTTPStatusError as exc:
+                raise BridgeCredentialError(
+                    f"Signal daemon health check returned HTTP {exc.response.status_code}"
+                ) from exc
+            except (
+                httpx.ConnectError,
+                httpx.TimeoutException,
+                httpx.NetworkError,
+            ) as exc:
+                raise BridgeCredentialError(
+                    f"Cannot reach Signal daemon at '{norm_url}': {exc}"
+                ) from exc
+
+            try:
+                await client.list_groups()
+            except (UntrustedIdentityException, SignalRpcError) as exc:
+                raise BridgeCredentialError(
+                    f"Signal account '{norm_account}' error: {exc}"
+                ) from exc
+        except BridgeCredentialError:
+            raise
+        except Exception as exc:
+            raise BridgeCredentialError(
+                f"Signal credential verification failed: {exc}"
+            ) from exc
+        finally:
+            await client.close()
 
     @classmethod
     def classify_failure(cls, exc: BaseException) -> FailureReason | None:
@@ -124,7 +196,9 @@ class SignalAdapter(PlatformAdapter):
             if exc.code == -32600 or "unauthorized" in exc.message.lower():
                 return "auth_failed"
             return "platform_error"
-        if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)):
+        if isinstance(
+            exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)
+        ):
             return "network"
         return None
 
@@ -179,7 +253,9 @@ class SignalAdapter(PlatformAdapter):
         retry_delay = 1.0
         while not self._stopped:
             try:
-                async for event_id, payload in self._client.stream_events(self._last_event_id):
+                async for event_id, payload in self._client.stream_events(
+                    self._last_event_id
+                ):
                     if self._stopped:
                         break
                     await self._process_event(payload)
@@ -231,16 +307,15 @@ class SignalAdapter(PlatformAdapter):
             return
 
         text = data_msg.get("message") or ""
+        timestamp = int(data_msg.get("timestamp", 0))
 
-        # Filter out self-messages generated by Switch agents to prevent loops
-        if text.startswith("[") and "]" in text[:30]:
+        # Filter out echo of our own outbound messages across groups or Note to Self
+        if timestamp in self._outbound_timestamps:
             return
 
         # Regular dataMessage self-message filter
         if not is_note_to_self and source == self.config.account:
             return
-
-        timestamp = int(data_msg.get("timestamp", 0))
 
         group_info = data_msg.get("groupInfo")
         if group_info and "groupId" in group_info:
@@ -255,8 +330,8 @@ class SignalAdapter(PlatformAdapter):
         # Deduplication reference
         message_ref = f"{self.config.account}:{conv_key}:{source}:{timestamp}"
 
-        # Store in quote cache
-        self._quote_cache[(channel_id, timestamp)] = (source, text)
+        # Store in bounded LRU quote cache
+        self._cache_quote(channel_id, timestamp, source, text)
 
         # Thread root ID from quote if present
         root_id: str | None = None
@@ -299,7 +374,9 @@ class SignalAdapter(PlatformAdapter):
                         )
                     )
                 except Exception as exc:
-                    logger.warning("Failed to fetch Signal attachment %s: %s", att_id, exc)
+                    logger.warning(
+                        "Failed to fetch Signal attachment %s: %s", att_id, exc
+                    )
                     attachment_failures.append(
                         AttachmentFailure(filename=filename, reason=str(exc))
                     )
@@ -390,7 +467,10 @@ class SignalAdapter(PlatformAdapter):
             )
             if sent_ts:
                 last_timestamp = sent_ts
-                self._quote_cache[(channel_id, sent_ts)] = (self.config.account, rendered_text)
+                self._record_outbound_timestamp(sent_ts)
+                self._cache_quote(
+                    channel_id, sent_ts, self.config.account, rendered_text
+                )
 
         return str(last_timestamp) if last_timestamp else None
 
@@ -444,7 +524,9 @@ class SignalAdapter(PlatformAdapter):
             )
         except Exception as exc:
             logger.warning("Signal message delete failed: %s", exc)
-            raise RemovalFailed(f"Could not delete message {message_id}: {exc}") from exc
+            raise RemovalFailed(
+                f"Could not delete message {message_id}: {exc}"
+            ) from exc
 
     async def send_typing(
         self,
@@ -466,6 +548,62 @@ class SignalAdapter(PlatformAdapter):
         except Exception as exc:
             logger.debug("Signal typing indicator failed: %s", exc)
 
+    async def mark_activity(
+        self,
+        channel_id: str,
+        message_ref: str,
+        *,
+        agent_name: str,
+        mark: ActivityMark,
+        on: bool,
+        force: bool = False,
+    ) -> None:
+        """Update reaction activity indicator on the target message."""
+        emoji = _REACTION_MAP.get(mark)
+        if not emoji:
+            return
+
+        parts = message_ref.split(":")
+        target_author: str | None = None
+        target_timestamp: int | None = None
+        if len(parts) >= 2:
+            try:
+                target_timestamp = int(parts[-1])
+                target_author = parts[-2]
+            except (ValueError, IndexError):
+                pass
+
+        if not target_timestamp or not target_author:
+            return
+
+        is_group = channel_id.startswith("group:")
+        group_id = channel_id[6:] if is_group else None
+        recipient = None if is_group else channel_id
+
+        try:
+            await self._client.send_reaction(
+                emoji=emoji,
+                target_author=target_author,
+                target_timestamp=target_timestamp,
+                recipient=recipient,
+                group_id=group_id,
+                remove=not on,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to update Signal reaction %s (on=%s) on %s: %s",
+                emoji,
+                on,
+                message_ref,
+                exc,
+            )
+
+    async def notify_working(
+        self, channel_id: str, agent_name: str, thread_root_id: str | None
+    ) -> None:
+        """Signal once that the agent has begun working (ephemeral typing)."""
+        await self.send_typing(channel_id, agent_name, True)
+
     async def create_channel(
         self,
         name: str,
@@ -484,11 +622,22 @@ class SignalAdapter(PlatformAdapter):
             return "channel_public"
         return "direct"
 
-    async def add_agents_to_channel(self, *a: Any, **k: Any) -> Any:
+    async def add_agents_to_channel(
+        self, channel_id: str, agent_names: list[str]
+    ) -> None:
         return None
 
-    async def add_users_to_channel(self, *a: Any, **k: Any) -> Any:
-        return None
+    async def add_users_to_channel(
+        self,
+        channel_id: str,
+        user_names: list[str],
+        user_external_ids: list[str],
+    ) -> list[str]:
+        """Signal group membership cannot be managed directly from Switch.
+
+        Returns all external IDs as failed additions.
+        """
+        return list(user_external_ids)
 
     async def create_agent_identity(self, agent: AgentIdentity) -> None:
         return None
