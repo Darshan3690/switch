@@ -44,13 +44,228 @@ version of their own to them without also giving them a release of their own.
 
 ### [Unreleased]
 
+#### Security
+- **A refused request is no longer repeated back.** When the gateway or the
+  agent API refused a request as invalid, the 422 repeated what was sent: a
+  password too short to accept, or the whole body, password included, when
+  another field was missing. Registering or editing a Slack, Discord or Teams
+  connection with a config that did not fit quoted part of its bot token or
+  secret, and on an edit that could be the stored token, which nothing else
+  returns. Anything that records error responses (APM, proxies, browser HAR
+  captures) could end up holding passwords and tokens. Each error now says
+  only where and what is wrong (`type`, `loc` and `msg`), and the agent API no
+  longer writes the request body to its log. A script that read `input` or
+  `ctx` from a 422 will find them gone. A validation rule that raised its own
+  error on the agent API now answers 422 rather than 500.
+- **Agents are no longer handed a key that never expires.** Datadog connects
+  with an API key and an application key that do not expire and that only
+  Datadog can revoke, and an agent granted Datadog was handed both. Switch now
+  refuses: Datadog can no longer be connected or granted, and an agent with an
+  existing Datadog grant is told why when it asks. A Datadog connection made
+  before can still be disconnected; revoke the keys in Datadog if they were
+  ever granted to an agent.
+- **Service connections start off in a new workspace.** A workspace created
+  from now on has every service connection switched off until a workspace
+  admin switches each on under Connectors. Workspaces that already had members
+  keep every service on by default, as before, along with every switch an
+  admin already set.
+- **A Google Workspace token is never handed out with more than an hour
+  left,** and one Google issues for longer is refused.
+- **Withdrawing access says what it could not take back.** Removing a grant,
+  disconnecting, or switching a service off for the workspace cannot revoke an
+  Atlassian or Google Workspace token already given to an agent, since that
+  token is the owner's own. The change now marks those tokens withdrawn and
+  its warning names the service and the time until which they may keep
+  working: up to an hour for Google Workspace, and up to eight hours for
+  Atlassian, whose tokens cannot be asked for shorter.
+- **A template's room params name only rooms its runner can see.** A room
+  param checked its value against every room on the server, and `$first` or
+  a list of candidates could settle on someone else's private room. That told
+  the runner the room existed and could write its name into their new room.
+  Now a room the runner cannot read reads as missing.
+
+#### Added
+- **The `[CONN]` log lines say when a client fell back to the event stream.**
+  `/events` takes optional `fallback` and `fallback_close_code` parameters,
+  and the `[CONN] opened` and `[CONN] reattached` lines end with
+  `fallback=<reason>:<close code>` only when they are present, so a new agent
+  runtime whose WebSocket never opened is told apart from a client built
+  before the socket. Unknown reasons log as `other` and anything but a short
+  numeric close code is dropped.
+- **Templates carry packages.** A room in a template takes `packages:`, a list
+  of packages that already exist, by `id` or by `name`, attached when the room
+  is created. The person running the template must be able to attach each one
+  by hand; a package that is missing, ambiguous or not theirs stops the run
+  before the room exists. A template never creates or changes a package.
+  Capturing a room (`GET /rooms/{id}/yaml`) now lists its packages by `id`,
+  so a room built again from its capture gets them back (#910).
+- **An agent can read its own addressing policy.** `get_agent_detail` now
+  returns `addressing`: the kind of policy (`owner_only`,
+  `owner_and_owner_agents`, `anyone` or `custom`) and, when an agent looks
+  itself up, its rules with the people, agents and rooms they name. So an
+  agent can tell someone who may answer its questions and approvals instead
+  of guessing. Another agent sees only the kind.
+- **Console hears when your managed agents or machines change.** A signed-in
+  user's Console opens one WebSocket per workspace (`/gateway/changes/ws`), and
+  switch-core tells it when one of their managed agents or machines changed, so
+  Console reads it again instead of polling. A notice names a kind and an id
+  and carries nothing else. Notices travel between replicas on the signal bus,
+  so a change made through one pod reaches a Console connected to another
+  (#717).
+- **The Airtable connection.** A person connects Airtable from Switch Console,
+  choosing at Airtable's consent screen which bases and workspaces to share,
+  and a granted agent reads and updates records and comments in them, as that
+  person, through Airtable's MCP server. Each server's operator registers and
+  publishes an Airtable OAuth integration and saves it under Connector apps,
+  or names it in `AIRTABLE_CLIENT_CONFIG_PATH` (Helm:
+  `switchCore.airtableClientSecret`); see `docs/old/airtable-setup.md`.
+  Without it, Airtable is listed as not set up. Like Google Workspace, it
+  needs `GATEWAY_PUBLIC_URL`: Airtable sends people back to the server's own
+  callback. On a server without one, both are listed as unavailable
+  (`needs_public_url`), saying why, rather than failing when someone
+  connects.
+  Airtable offers no read-only sign-in, so every connection can write;
+  changing tables and fields is not asked for, and Airtable refuses it.
+  Airtable cannot revoke a sign-in, and an integration reaches the bases of
+  every grant a person gave it, so a sign-in Switch stops using still works
+  and widens their next connection. Disconnecting or reconnecting says so and
+  where in Airtable to remove it, as any OAuth service without revocation now
+  does rather than reporting a failed revoke.
+- **Connector apps set up Airtable.** An app's entry in `GET /connector-apps`
+  gains `redirect_uris` (every address to register), `needs_public_url` and
+  `scopes`. The dashboard's Connectors page walks Airtable's Builder Hub, with
+  its redirect URL to copy and the scopes to tick, and saves only once the
+  operator confirms the integration's support details are set: no check can
+  see whether it is published, so a passing one says so. Saving an app
+  answers with its checks too, so the page can show them. A passing Google
+  Workspace check now says it can't see the redirect URI either: Google
+  compares it only when someone signs in.
+
+#### Changed
+- **An agent's stream reads in one database session per pass, and pooled
+  connections are no longer pinged before use.** A pass that delivered a
+  message opened a session for each of its reads, six pool checkouts and six
+  transactions, and the pre-ping added a transaction to every checkout. The
+  reads of a pass now share one session, for an agent on its own socket and
+  for each agent an agent controller serves. `DB_POOL_PRE_PING` now defaults
+  to `false`: after a database restart the first query on each pod fails, along
+  with any query running at the time, and the pool then replaces every
+  connection it held. Set it to `true` behind
+  anything that drops idle connections. In a load test of 300 agents at 10
+  messages a second on 2 pods, CPU per message fell by a quarter and database
+  transactions per message by more than two thirds. At most half of a pod's
+  pool goes to streams' passes at once, so requests still get a connection
+  when the pod's CPU is saturated.
+- **A cloud machine can move to another instance type and keep its disk.**
+  The hosted controller now launches every new instance of a machine as the
+  instance type in its `gateway.json`, at the same moment it already moves the
+  machine onto the configured image, and `upgrade --gateway-config` moves a
+  stopped machine onto both. Changing `instance_type` therefore resizes
+  existing machines as well as new ones; a machine that only stops and starts
+  keeps its instance and type. `allowed_instance_types` is no longer bound to
+  the controller's state database, so it can change while machines exist, and
+  `status` and `list` report `instance_type_allowed` for each machine. A
+  database bound before this release is accepted and rebound on first start,
+  as long as `allowed_instance_types` has not changed in the same deploy.
+- **Agents and controllers are pinged every 10 seconds instead of every 2.**
+  A connection is now declared dead after 30 seconds without a beat, up from
+  6, so a client that goes away holds its room slot and shows online for up to
+  30 seconds. The interval is advertised on every open, so clients follow it
+  without an update. The agent auth cache now gives each entry a random 80 to
+  120% of `AGENT_AUTH_CACHE_TTL_SECONDS`, so entries filled together after a
+  restart do not all expire together, and that setting must stay below 25
+  seconds (the 30 second heartbeat TTL, less the jitter) or startup refuses it.
+- **Following the conversation is described the same way everywhere, and the
+  chart can turn it on.** The feature added in 0.31.0 is off unless
+  `follow_the_conversation` is among the enabled feature flags
+  (`FEATURE_FLAGS_ENABLED`, or `switchCore.featureFlags.enabled` in the Helm
+  chart). The Switch skill and the agent runtime's instructions no longer tell
+  agents that a message without their name can never reach them: a person's
+  follow-up can, while other agents' chatter still does not. The chart lists
+  the flag and, while it is on, sets `FOLLOW_THE_CONVERSATION_WINDOW_SECONDS`
+  from `switchCore.followTheConversation.windowSeconds` (default 300).
+- **Agents name room groups by path.** `create_room` and `create_room_group`
+  take a group as a path such as `Fraud/Incidents` (the top-level group, then
+  each child), so two groups called `Incidents` under different parents no
+  longer break every agent request that names one. A bare name still works
+  when only one group has it; when several do, the error lists each match by
+  its path so the agent can retry with the right one, and an unknown path
+  names the first part that was not found. A group id is accepted too.
+- **Room group names are unique among siblings.** Creating, renaming or moving
+  a group next to one with the same name (ignoring case) is refused with an
+  error naming the existing group, from the dashboard, the API and agents
+  alike. The same name under different parents is still fine. Deleting a
+  group whose subgroup would move up next to a namesake is refused too, and
+  the dashboard now shows why. Names can no longer contain `/` or be blank.
+  Existing duplicates are left as they are and can be reached by id.
+
 #### Fixed
+- **The agent HTTP API answers a refused or malformed request with a 4xx, not
+  a 500.** Inviting an agent to a room the caller may not change answered 500
+  instead of 403, and so did looking up a room the agent is not in. A room
+  history request whose `since` or `before` is not an ISO 8601 timestamp
+  answered 500 instead of 400; it now says which parameter was wrong, and so
+  does `read_context` (#1045). One whose offset moves it outside the years 1
+  to 9999 in UTC is refused the same way instead of answering 404, and a time
+  in the last millisecond of 9999 is no longer refused at all.
+- **Creating a user refuses a role the server does not understand.** An
+  account is a user or an admin, and only the exact role `admin` grants
+  operator rights. `POST /users` accepted any role string, so `Admin` or
+  `owner` created an account that was shown with that role, was stored with
+  it, and had no operator rights. Anything other than `user` or `admin` is now
+  a 422 and creates nothing. The Add User dialog offers only those two, so
+  only scripts calling the API were affected. Accounts already stored with
+  another role are left as they are, still listed with that role and still
+  treated as ordinary users; `SELECT id, email, role FROM users WHERE role
+  NOT IN ('user', 'admin')` finds them.
+- **Every way of setting a password now applies the same rules.** Signup
+  already required 8 characters and at most 72 bytes. Changing your own
+  password checked only the 8 characters, and an admin creating a user checked
+  nothing, so a short or empty password went through, and a long passphrase
+  was saved as just its first 72 bytes, the most bcrypt reads. Both now refuse
+  what signup refuses, saying why. Creating a user also trims, lowercases and
+  checks the email the way signup does, so the same address with a stray
+  space no longer makes a second account, and an address with no dot in its
+  domain is refused. A script that creates users through `POST /users` gets a
+  422 for either. Passwords already saved still work (#1035).
+- **Full garbage collections no longer stall the server for hundreds of
+  milliseconds.** Once boot has built what lasts for the life of the process
+  (modules, the ORM's mappers, the app's routes), the server freezes it out of
+  garbage collection, so a full pass walks only what was made since. The
+  clients and bridges started after that stay collectable, since replicas hand
+  them to one another. The dashboard's pause chart now shows the average pause
+  next to p99, as Datadog keeps the average for longer.
+- **Agents no longer read offline while their replica shuts down.** With several
+  replicas, a stopping replica released its lease before its 5 s drain, so for
+  up to about 6 s the other replicas counted its connected agents as gone: `@role`
+  mentions did not reach the holder, rooms got false "offline" notices, and stop
+  and reset commands were refused. It now drains first and closes its sockets
+  as it releases.
+- **A request card posted in a thread now mentions the person who can answer
+  it.** Approval and question cards go into the thread of the turn that raised
+  them, and on Slack they used to mention nobody there, so an owner who was not
+  in the thread was never told and the agent waited. A card in a thread now
+  mentions the person who asked when the agent's addressing policy lets them
+  answer, otherwise the agent's owner if they may answer, otherwise nobody.
+  It never mentions more than one person, even when the policy lets anyone
+  answer. Cards at the top of a channel mention whoever asked, as before.
+- **`!list-references` and `!list-documents` include what packages bring.**
+  They listed only what was attached to the room directly, so a room whose
+  references all came from a package answered "No references in this room."
+  while its agents were sent them. Items from attached packages now follow
+  the direct ones, each marked with the package it comes from (for example
+  `(github, via Payments service context)`); an item attached both ways is
+  listed once, as direct (#911).
 - **The template guide agents read now covers a room's `roles:`,
   `references:` and `docs:`.** All three already worked in a room resource
   and appear when a room is captured, but the guide stopped at `aliases:`, so
   an agent writing a template did not know they existed or what shape they
   take. It now gives each one's fields, a sentence on what it does, and a
   short example.
+- **switch-buddy no longer says the Mattermost switch waits for a server
+  restart.** Turning it on starts Mattermost straight away on a running local
+  server, but switch-buddy's instructions still said it took effect at the next
+  start, which sent people to restart the server for nothing (#1021).
 - **The Teams command menu fits Teams' limit again.** Switch's own Teams app
   listed thirteen commands, one more than Teams allows, once `/remove-agent`
   joined it. Both Teams apps now offer the same twelve: `/remove-agent` is in,
@@ -59,6 +274,18 @@ version of their own to them without also giving them a release of their own.
   uploaded again.
 
 #### Removed
+- **Breaking for HTTP clients: the `/agents/{id}/moderation/…` routes are
+  removed** and answer `404`. They predate the operations door, which runs the
+  same operations as MCP. Call `POST /agents/{id}/ops/<operation>` with the
+  operation's arguments as the JSON body instead:
+  `POST moderation/rooms` is `create_room`,
+  `POST moderation/rooms/{room_id}/invite` is `invite_agent_to_room`,
+  `GET moderation/rooms` is `list_all_rooms`,
+  `GET moderation/rooms/{room_id}` is `get_room_detail`,
+  `GET moderation/agents` is `list_agents`, and
+  `GET moderation/bridges` is `list_bridges`. The reply is
+  `{"result": …}` in the operation's own shape, so `list_all_rooms` gives
+  `room_id` where the old route gave `id`.
 - **`!run-cmd`, and the terminal command in offline replies.** A CLI started
   with that command got none of the Switch tools, so it never brought the agent
   online. The reply for an agent that is offline or not live now says what's
@@ -1828,6 +2055,103 @@ version of their own to them without also giving them a release of their own.
 ## switch-console
 
 ### [Unreleased]
+
+#### Added
+- **Replace a messaging app's token without disconnecting it.** When a bot
+  token is rotated or leaked, a workspace admin can paste the new one from the
+  connection's menu on the server page. The connection restarts with it and
+  keeps its rooms. Offered on connections to your own bot, not on ones that
+  came from installing Switch's app.
+- **Airtable's logo on the Connections grid.**
+- **Admin → Connector apps sets up Airtable.** Its dialog walks Airtable's
+  Builder Hub with the redirect URL to copy and the scopes to tick, and asks
+  the operator to confirm the integration's support details are set, which no
+  check can see. A server that does not send `redirect_uris`,
+  `needs_public_url` and `scopes` is read as before.
+- **Saving a connector app shows what its check said.** After Check and save
+  or an updated secret, the app's page opens with the vendor's answer and any
+  note, as Check it works shows them.
+- **Connectors says why Airtable or Google Workspace can't be connected on a
+  server without a public address**: the operator is told to set
+  `GATEWAY_PUBLIC_URL`, and everyone else whom to ask.
+- **Codex sessions can use an API key kept in the OS keyring.** With
+  `cli_auth_credentials_store = "keyring"` or `"auto"`, the execution machine's
+  Codex keeps its login in the keyring, where a session's own Codex home cannot
+  find it, so every session failed with "Sign in on the execution machine with
+  codex login" while `codex login status` said it was signed in (#1048). When
+  the machine has no `auth.json` to copy, a session now asks its Codex for the
+  API key as it starts and keeps it in the memory of the session's own Codex
+  process: it is not written to a file, put in the environment or copied into
+  another keyring entry, and a changed key is picked up at the next start. A
+  ChatGPT login in the keyring cannot be handed over, and the session says so
+  with the file-storage workaround; it also refuses to hand over the key when an
+  administrator's Codex configuration would have it saved elsewhere. A session
+  that still has a working login of its own, such as one it copied while the
+  machine had an `auth.json`, starts as before; a copy that no longer works is
+  removed.
+
+#### Changed
+- **Managed agents and machines update when the server says they changed.**
+  Against a server that pushes change notices, Console reads those lists
+  again when told to, and otherwise only every five minutes instead of every
+  15 to 30 seconds; against one that does not, it polls as before (#717).
+- **One name for the controller.** Console, the Gateway and the docs say
+  "agent controller" everywhere, matching the `switch-agent-controller`
+  package, instead of a mix of "agent controller" and "agents controller".
+  The delete dialog on a server's page now calls it "this Switch server that
+  Console runs" rather than a "managed server", which read like "managed
+  agent"; it was the only place Console showed that name.
+
+#### Fixed
+- **Giving a machine a Vertex AI login no longer pre-fills a project.** The
+  Google Cloud project field started out filled with one organisation's own
+  project, so anyone else who kept it got a sign-in failure with nothing to
+  say why. It now starts empty, with a placeholder; the region still starts
+  at `global`.
+- **Two agent hosts starting at once on Windows no longer crash each other.**
+  A host reading another host's ownership ticket while that host replaced or
+  deleted it got `EPERM` from Windows and exited. It now tries the read again
+  for a few seconds, as it already did for its own writes.
+- **Settings → Agent providers keeps this computer's report current.** It
+  prefers the report from the server Console is on, rereads it while open and
+  after the controller reports again, and the install section says so when
+  Console's own check disagrees with the controller's.
+- **The local Switch server starts on Intel Macs without Homebrew.**
+  cryptography publishes no wheel for Intel Macs, so the Intel build of
+  Console compiled its own against the build machine's Homebrew OpenSSL, and
+  on a Mac without Homebrew the server failed to start with `Library not
+  loaded: /usr/local/opt/openssl@3/lib/libssl.3.dylib`. The bundled
+  cryptography now carries its own OpenSSL, as cryptography's wheels for Apple
+  silicon do, and a macOS build fails if anything in the local server links a
+  library that is neither macOS's nor shipped with it.
+- **Setting up a server notices Docker once it starts.** "Set up a server on
+  this computer" checked for Docker only when the step opened, so installing or
+  starting Docker meanwhile left the setup skipping Mattermost until you went
+  back. It now checks again every few seconds, and when Console regains focus,
+  while Docker isn't answering.
+- **Starting Docker with the server page open now enables the Mattermost
+  switch.** The server page checked for Docker only when it opened, so Docker
+  Desktop started afterwards left the switch greyed out until you left the
+  page and came back. It now checks again the way the setup step does. A
+  running server whose Mattermost was left out or failed to start, because
+  Docker was off, shows the switch off, so turning it on brings Mattermost up
+  without a restart (#1021).
+- **A local Mattermost shows up as soon as it is ready.** When the Mattermost
+  beside a local server finished setting up, pages already open kept showing no
+  Mattermost and asked you to link an account until the server was restarted.
+  They now refresh the messaging apps and linked accounts the moment it is up
+  (#1021).
+- **Agents say who can answer their questions and approvals.** The Switch
+  skill said a request card needed the owner's linked identity and room
+  membership. Its addressing policy decides, and agents now read theirs with
+  `get_agent_detail` and name the people who can answer.
+- **Giving this computer's Codex login to a machine explains a keyring
+  login.** When Codex keeps its login in the OS keyring
+  (`cli_auth_credentials_store = "keyring"` or `"auto"`), it said "This
+  computer is not signed in to codex". It now says the login is in the keyring,
+  which cannot be given to another machine, and gives the workaround for a
+  machine whose organization does not enforce the keyring: switch Codex to file
+  storage, which keeps the login in plaintext, and sign in again (#1048).
 
 ### [0.40.1] - 2026-10-21
 
@@ -3814,9 +4138,10 @@ tags; see RELEASING.md.
   signed in.** `claude auth status` only says a login or key is present, so a
   key left by an old install read as signed in while every session failed.
   When setting up, on a recheck, and whenever a login was not yet known to
-  work, the controller now sends Claude Code one short test prompt and reports
-  what it said if it fails. A Claude Code too old to have `auth status` is
-  reported as such instead of as a check that never finished.
+  work, the controller now sends Claude Code one short test prompt, with the
+  person's hooks off and stdin closed, and reports what it said if it fails,
+  from its result, its `errors` or its stderr. A Claude Code too old to have
+  `auth status` is reported as such instead of as a check that never finished.
 - **A controller updates to the release Switch names while sessions sit idle.**
   It waited until no session existed on the machine, and a session connected to
   a room counted even with nothing to do, so a machine with long-lived sessions
@@ -3883,6 +4208,13 @@ The Switch protocol client and MCP runtime
 (`console/packages/switch-agent-runtime/`). Version lives in its `package.json`.
 
 ### [Unreleased]
+
+#### Added
+- When the WebSocket never opens and the runtime asks for the event stream
+  instead, the request carries `fallback=socket_never_opened` and the
+  socket's close code as `fallback_close_code`, so the server's log can tell
+  it from a client built before the socket. Opening the event stream straight
+  away, against an old server, sends neither.
 
 ### [0.8.0] - 2026-09-25
 

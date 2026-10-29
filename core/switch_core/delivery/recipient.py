@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from switch_core.db.stores.agent_store import AgentStore
     from switch_core.db.stores.document_store import DocumentStore
     from switch_core.db.stores.external_user_store import ExternalUserStore
+    from switch_core.db.stores.package_store import PackageStore
     from switch_core.db.stores.reference_store import ReferenceStore
     from switch_core.db.stores.room_role_store import RoomRoleStore
     from switch_core.db.stores.room_store import RoomStore
@@ -181,12 +182,22 @@ class RecipientServices:
     room_store: RoomStore
     document_store: DocumentStore
     reference_store: ReferenceStore
+    package_store: PackageStore
     agent_session_store: AgentSessionStore
     room_role_store: RoomRoleStore
     external_user_store: ExternalUserStore
     connections: AgentConnectionRegistry
     frontend_base_url: str | None
     message_telemetry: MessageTelemetry
+
+
+class SwitchNotices(Protocol):
+    """What Switch has to tell each agent of a room before its next message,
+    read once for every agent in the room."""
+
+    async def switch_notice(
+        self, session: AsyncSession, agent_id: str
+    ) -> str | None: ...
 
 
 class ClientNames(Protocol):
@@ -479,6 +490,7 @@ class AgentRecipient:
         addressing: AddressingResolver,
         budget_guard: BudgetGuard,
         clients: ClientNames,
+        notices: SwitchNotices,
         cloud_waking_notices: set[tuple[str, int]],
     ) -> None:
         self.actor = actor
@@ -494,6 +506,7 @@ class AgentRecipient:
         self._room_store = services.room_store
         self._document_store = services.document_store
         self._reference_store = services.reference_store
+        self._package_store = services.package_store
         self._agent_session_store = services.agent_session_store
         self._room_role_store = services.room_role_store
         self._external_user_store = services.external_user_store
@@ -507,6 +520,7 @@ class AgentRecipient:
         self._addressing = addressing
         self._budget_guard = budget_guard
         self._clients = clients
+        self._notices = notices
         # The "machine is waking" notices this process has posted for the
         # agent, by room and machine start, so the messages that follow the
         # first one wait with it instead of each saying so again.
@@ -589,8 +603,9 @@ class AgentRecipient:
             if addressed
             else None
         )
+        notice = await self._switch_notice(session) if addressed else None
         own_event = _message_own_event(
-            meta, event, thread_id, self.agent.id, sender_role
+            meta, event, thread_id, self.agent.id, sender_role, notice
         )
 
         async def after(row: InboundEvent) -> None:
@@ -659,9 +674,10 @@ class AgentRecipient:
             await self._after_follow_up(row)
 
         sender_role = await self._sender_role(session, event.sender, event.content)
+        notice = await self._switch_notice(session)
         return Delivery(
             own_event=_message_own_event(
-                meta, event, event.thread_root_id, self.agent.id, sender_role
+                meta, event, event.thread_root_id, self.agent.id, sender_role, notice
             ),
             after=after,
         )
@@ -822,6 +838,7 @@ class AgentRecipient:
             if gate.addressed
             else None
         )
+        switch_notice = await self._switch_notice(session) if gate.addressed else None
 
         def own_event(row: InboundEvent) -> OwnEvent:
             parts = written(row)
@@ -848,6 +865,7 @@ class AgentRecipient:
                 ],
                 opening_message=opening,
                 sender_role=sender_role,
+                switch_notice=switch_notice,
             )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1314,7 +1332,7 @@ class AgentRecipient:
     async def _controller_unavailable_reply(
         self, session: AsyncSession, agent: Agent, meta: RoomMeta, asker_handle: str
     ) -> str | None:
-        """Why an agent run by an agents controller cannot answer here.
+        """Why an agent run by an agent controller cannot answer here.
 
         Never "open Switch Console": a managed agent
         is started by its controller, so the reply names what stands in the
@@ -1706,6 +1724,13 @@ class AgentRecipient:
             message=IncomingMessage(sender="", body=text),
         )
 
+    async def _switch_notice(self, session: AsyncSession) -> str | None:
+        """What Switch has to tell the agent before its next message: that
+        its template has a revision it was not brought fully up to
+        (`management/template_updates.py`). Told with every message until the
+        agent reads how it differs (`get_template_status`)."""
+        return await self._notices.switch_notice(session, self.agent.id)
+
     async def _sender_role(
         self, session: AsyncSession, sender: str, content: Mapping[str, object]
     ) -> str | None:
@@ -1779,6 +1804,7 @@ def _message_own_event(
     thread_id: str | None,
     agent_id: str,
     sender_role: str | None,
+    switch_notice: str | None,
 ) -> Callable[[InboundEvent], OwnEvent]:
     """How an agent's own event for a message is built once the message is
     written."""
@@ -1803,6 +1829,7 @@ def _message_own_event(
             thread_id=thread_id,
             opening_message=opening_message_for(meta, agent_id),
             sender_role=sender_role,
+            switch_notice=switch_notice,
         )
         # Serialising runs once per agent per message, so only when it will
         # be seen.

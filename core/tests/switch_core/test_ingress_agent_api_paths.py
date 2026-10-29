@@ -54,7 +54,9 @@ def _served_prefixes() -> set[str]:
         room_service=object(),  # type: ignore[arg-type]
         client_lifecycle=object(),  # type: ignore[arg-type]
         collab_lifecycle=object(),  # type: ignore[arg-type]
-        event_buffer=EventBuffer(object(), sequence_base=0, rooms=QuietRooms()),  # type: ignore[arg-type]
+        event_buffer=EventBuffer(
+            object(), sequence_base=0, rooms=QuietRooms(), session_slots=None
+        ),  # type: ignore[arg-type]
         resource_service=object(),  # type: ignore[arg-type]
         api_key_store=object(),  # type: ignore[arg-type]
         external_user_store=object(),  # type: ignore[arg-type]
@@ -67,7 +69,7 @@ def _served_prefixes() -> set[str]:
         gateway_ui=None,
     )
     prefixes = set(_ADDED_IN_MAIN)
-    # The agents controller's routes join the agent bridge app only when agent
+    # The agent controller's routes join the agent bridge app only when agent
     # management is on (`management/wiring.py`), so they are read from their
     # router here.
     for route in [*app.routes, *controller_router.routes]:

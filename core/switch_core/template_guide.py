@@ -119,6 +119,8 @@ existing agent may stand in for it.
                value: {urls: [...]}}]
   docs: [{name, description, instructions, content}]
   aliases: {agent key or name: alias}   # @alias addresses it in this room
+  packages: [{id: package id} or {name: package name}]   # packages that
+                                 # exist, attached as they are
   kickoff: text                  # posted once the room exists
   group: <group key>             # when the template has a group
 
@@ -152,7 +154,8 @@ references by id:
 
 Without bridge the room goes on the server's default messaging app; users
 needs one (make them depend on it: [{if: "{bridge}", value: [...]},
-{value: []}]). Several rooms go in one group.
+{value: []}]). Several rooms go in one group. packages must be ones the
+deployer can attach by hand; a missing or ambiguous one stops the run.
 
 ## A group (type: group)
 
@@ -199,6 +202,14 @@ agent that would not accept messages from you makes the run fail before
 anything is created (leave a new agent on the default, owner-agents, or give
 it anyone_in its room; owner shuts you out). Asking again for a room with the same kickoff you already used
 further up the same path pauses the run until your owner lets it continue.
+
+## Revisions and updates
+
+A template's revision is its own edit count, not the language version.
+Running a saved or official template by id records which agents that run
+created; an agent created from an official template is brought up to each new
+revision of it when the server starts, except for what someone changed and its
+permissions. get_template_status tells an agent how it differs from its own.
 
 ## Example
 
